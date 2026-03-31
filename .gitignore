@@ -4,3 +4,14 @@ __pycache__/
 out
 website/
 docs-minimind/
+
+# model checkpoints and large weights
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# optional local model export
+minimind-3/model.safetensors
