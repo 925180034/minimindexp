@@ -1,0 +1,497 @@
+# MiniMind 项目执行计划
+
+> 目标：将 MiniMind 改造成有真实实验数据的简历项目，求职方向：算法工程师（NLP/LLM）
+
+---
+
+## 整体分工
+
+| 模块 | 工作类型 | 产出物 | 状态 |
+|---|---|---|---|
+| 预训练 | 已完成 | loss 曲线截图 | ✅ |
+| SFT | 已完成 | loss 曲线截图 | ✅ |
+| LoRA 微调 | **动手实现** | F1 对比数据 | ⬜ |
+| AttnRes 架构 | **动手实现** | loss/norm 对比图 | ⬜ |
+| DPO 对齐 | 看懂 + 跑通 | reward 曲线截图 | ⬜ |
+| GRPO 强化学习 | 看懂 + 跑通 | reward 曲线截图 | ⬜ |
+| Tool Use / Agentic RL | 看懂 + 跑通 | 演示截图 | ⬜ |
+| 知识蒸馏 | **动手实现** | 速度/F1 对比数据 | ⬜ |
+
+---
+
+## 数据路径说明
+
+MiniMind 数据集通过软链接挂载，训练脚本无需修改路径直接运行：
+
+```
+/root/minimind/dataset/ → 软链接 → /root/autodl-tmp/dataset/
+```
+
+Jellyfish 数据集路径：
+```
+/root/autodl-tmp/jellyfish/
+├── train/
+│   ├── direct_answer_only/
+│   │   ├── schema_matching.jsonl    # 84,345 条（主用）
+│   │   ├── entity_matching.jsonl   # 42,957 条
+│   │   ├── error_detection.jsonl   #  5,829 条
+│   │   └── data_imputation.jsonl   #  1,364 条
+│   └── with_generated_reasoning/
+│       └── sm_gen_m8x7b.jsonl      # 84,345 条（含 Mixtral 推理链，蒸馏用）
+└── test/
+    ├── seen_tasks/
+    │   ├── schema_matching.jsonl   # 11,936 条（评测用）
+    │   ├── entity_matching.jsonl   # 14,862 条
+    │   ├── error_detection.jsonl   # 48,830 条
+    │   └── data_imputation.jsonl   #  4,020 条
+    └── unseen_tasks/
+        ├── AVE/
+        └── CTA/
+```
+
+Jellyfish 实际数据格式（`instruction` + `input` → `output`）：
+```json
+{
+  "instruction": "Your task is to determine if the two attributes (columns) are semantically equivalent...",
+  "input": "Attribute A is [name: \"...\", description: \"...\"].\nAttribute B is [name: \"...\", description: \"...\"].\nAre Attribute A and Attribute B semantically equivalent?\nChoose your answer from: [Yes, No]",
+  "output": "Yes"
+}
+```
+> 测试集额外有 `"dataset"` 字段（如 `"Synthea"`），转换时忽略即可。
+
+MiniMind SFT 目标格式：
+```json
+{"conversations": [
+  {"role": "user",      "content": "{instruction}\n{input}"},
+  {"role": "assistant", "content": "{output}"}
+]}
+```
+
+---
+
+## 时间规划
+
+```
+Week 1: LoRA + 数据转换脚本 + 评测
+Week 2: AttnRes 实现
+Week 3: AttnRes 对比实验 + DPO + GRPO 跑通
+Week 4: Tool Use + 蒸馏 + 整理所有实验数据
+```
+
+---
+
+## Week 1：LoRA 微调（Schema Matching）
+
+**目标：** 用 Jellyfish SM 数据做 LoRA 微调，测出 F1 提升数字
+
+### Step 1 — 数据格式转换
+
+文件路径：`experiments/lora_schema_matching/convert_jellyfish.py`
+
+```python
+import json
+
+def convert(input_path, output_path, max_samples=None):
+    """将 Jellyfish 格式转为 MiniMind SFT 格式"""
+    with open(input_path) as fin, open(output_path, 'w') as fout:
+        for i, line in enumerate(fin):
+            if max_samples and i >= max_samples:
+                break
+            item = json.loads(line)
+            # 合并 instruction + input 作为 user 内容
+            user_content = item["instruction"] + "\n" + item["input"]
+            out = {
+                "conversations": [
+                    {"role": "user",      "content": user_content},
+                    {"role": "assistant", "content": item["output"]}
+                ]
+            }
+            fout.write(json.dumps(out, ensure_ascii=False) + '\n')
+
+if __name__ == "__main__":
+    # 训练集（用 direct_answer_only，不带推理链，更简洁）
+    convert(
+        "/root/autodl-tmp/jellyfish/train/direct_answer_only/schema_matching.jsonl",
+        "/root/autodl-tmp/jellyfish/sm_train_minimind.jsonl"
+    )
+    # 测试集
+    convert(
+        "/root/autodl-tmp/jellyfish/test/seen_tasks/schema_matching.jsonl",
+        "/root/autodl-tmp/jellyfish/sm_test_minimind.jsonl"
+    )
+    print("转换完成")
+```
+
+> ⚠️ 84K 条数据全量训练时间较长，调试阶段先加 `max_samples=2000` 快速验证。
+
+### Step 2 — 运行 LoRA 微调
+
+```bash
+cd /root/minimind
+python trainer/train_lora.py \
+  --data_path /root/autodl-tmp/jellyfish/sm_train_minimind.jsonl \
+  --lora_name lora_schema_matching \
+  --epochs 3
+```
+
+### Step 3 — 评测脚本
+
+文件路径：`experiments/lora_schema_matching/eval_sm.py`
+
+评测逻辑：
+- 从测试集随机抽取 200 条（Yes/No 各半，保持平衡）
+- 分别用 `full_sft` 和 `full_sft + lora_schema_matching` 推理
+- 解析输出中的 Yes/No，计算 Precision / Recall / F1
+- 保存结果到 `f1_results.txt`
+
+### 产出物
+
+```
+experiments/lora_schema_matching/
+├── convert_jellyfish.py
+├── eval_sm.py
+├── loss_curve.png
+├── f1_results.txt          ← 微调前后 F1 对比（真实数字）
+└── example_outputs.txt     ← 5-10 条典型样本回答对比
+```
+
+**简历数字：** LoRA 微调后 Schema Matching F1 从 XX 提升至 XX（基于 Jellyfish 测试集）
+
+---
+
+## Week 2：AttnRes 架构改造
+
+**目标：** 实现 Attention Residuals（Kimi 2026），验证是否改善各层输出均匀性
+
+### 论文核心原理
+
+标准残差：`h_l = h_{l-1} + f_{l-1}(h_{l-1})`（固定单位权重累加）
+
+AttnRes：`h_l = Σ α_{i→l} · v_i`，其中：
+- `α_{i→l}` = softmax 注意力权重，由每层独立的可学习伪查询 `w_l ∈ R^d` 计算
+- 允许每层**选择性地**聚合之前所有层的输出
+- 解决 PreNorm 下隐状态随深度 O(L) 增长（各层贡献被稀释）的问题
+
+MiniMind 只有 8 层，适合实现 Full AttnRes（不需要 Block 变体）。
+
+### Step 1 — 读懂原始 MiniMindBlock
+
+重点读 `/root/minimind/model/model_minimind.py`：
+- `MiniMindBlock.__init__`：各子层定义
+- `MiniMindBlock.forward`：残差连接的位置和计算方式
+- `MiniMindForCausalLM.forward`：各层如何串联
+
+### Step 2 — 创建 AttnRes 版本
+
+```bash
+# 不改原文件，新建实验版本
+cp /root/minimind/model/model_minimind.py \
+   /root/minimind/model/model_minimind_attnres.py
+```
+
+**核心改动（约 40-60 行）：**
+
+`MiniMindBlock.__init__` 新增：
+```python
+# 每层一个可学习的伪查询向量（零初始化）
+self.attn_res_query = nn.Parameter(torch.zeros(config.hidden_size))
+```
+
+`MiniMindBlock.forward` 修改签名和残差部分：
+```python
+def forward(self, x, pos_cis, past_kv=None, use_cache=False,
+            prev_hiddens=None):   # 新增：前面所有层的 hidden state 列表
+    ...
+    if prev_hiddens is not None and len(prev_hiddens) > 0:
+        # Stack: [num_prev_layers, batch, seq, hidden]
+        stacked = torch.stack(prev_hiddens, dim=0)
+        # 计算注意力权重
+        q = self.attn_res_query  # [hidden]
+        # keys: [num_prev, hidden] (对序列维度平均)
+        keys = stacked.mean(dim=2)  # [num_prev, batch, hidden]
+        scores = torch.einsum('h,lbh->lb', q, keys)  # [num_prev, batch]
+        weights = torch.softmax(scores, dim=0)        # [num_prev, batch]
+        # 加权聚合
+        residual = torch.einsum('lb,lbsh->bsh', weights, stacked)
+        h = residual + self.drop(h_attn)
+    else:
+        h = x + self.drop(h_attn)   # 第一层退化为标准残差
+    ...
+```
+
+`MiniMindForCausalLM.forward` 维护 hidden list：
+```python
+hidden_states_list = []
+for layer in self.layers:
+    h = layer(h, pos_cis, prev_hiddens=hidden_states_list, ...)
+    hidden_states_list.append(h.detach())  # detach 避免内存爆炸
+```
+
+### Step 3 — 对比实验脚本
+
+文件路径：`experiments/attnres/run_comparison.py`
+
+训练时每 100 步记录：
+```python
+metrics = {
+    "step": step,
+    "loss_standard": float,
+    "loss_attnres": float,
+    "layer_norms_std": [float × 8],   # 各层 hidden state L2 norm（均值）
+    "layer_norms_atr": [float × 8]
+}
+# 写入 experiments/attnres/metrics.jsonl
+```
+
+### Step 4 — 画图
+
+文件路径：`experiments/attnres/plot_results.py`
+
+- 图1：两条 loss 曲线（标准残差 vs AttnRes）
+- 图2：各层 hidden state norm 柱状图（直观展示均匀性改善）
+
+### 产出物
+
+```
+experiments/attnres/
+├── run_comparison.py
+├── plot_results.py
+├── metrics.jsonl
+├── loss_comparison.png          ← 标准残差 vs AttnRes loss 曲线
+└── layer_norm_comparison.png    ← 各层 norm 均匀性对比
+```
+
+**简历数字：** 相同步数 AttnRes loss 低 X%；各层 norm 标准差从 X 降至 Y（更均匀）
+
+---
+
+## Week 3 前半：DPO 对齐
+
+**目标：** 看懂原理 + 跑通 + 记录 reward 曲线
+
+```bash
+cd /root/minimind
+python trainer/train_dpo.py \
+  --data_path /root/minimind/dataset/dpo.jsonl
+```
+
+**必须看懂的核心（`trainer/train_dpo.py` 中的 `dpo_loss` 函数）：**
+
+```
+L_DPO = -E[ log σ( β×(log π_θ(y_w|x) - log π_ref(y_w|x))
+                  - β×(log π_θ(y_l|x) - log π_ref(y_l|x)) ) ]
+```
+
+面试必答：
+- 为什么 DPO 不需要显式 reward model？（隐式地将 reward 参数化为策略比率）
+- ref_model 的作用是什么？（KL 惩罚项，防止策略偏移太远）
+
+**产出物：**
+```
+experiments/dpo/
+├── reward_curve.png     ← chosen/rejected reward margin 随步数变化
+└── qa_comparison.txt    ← 训练前后 3-5 个问题的回答对比
+```
+
+---
+
+## Week 3 后半：GRPO 强化学习
+
+**目标：** 看懂原理 + 跑通
+
+```bash
+python trainer/train_grpo.py \
+  --data_path /root/minimind/dataset/rlaif.jsonl
+```
+
+**必须看懂的核心概念：**
+- **GRPO vs PPO**：GRPO 不需要 Value network（Critic），用同一 prompt 的 group 内 reward 均值作为 baseline
+- **reward 计算**：InternLM2-1.8B-Reward 模型输出分数
+- **group relative**：同一 prompt 采样 G 个回复，`Â_i = (r_i - mean(r)) / std(r)`
+
+> ⚠️ 显存约 8GB：策略模型 + 参考模型（frozen）+ 奖励模型同时在显存
+
+**产出物：**
+```
+experiments/grpo/
+└── reward_curve.png     ← group reward 均值随训练步数上升曲线
+```
+
+---
+
+## Week 4 前半：Tool Use & Agentic RL
+
+**目标：** 跑通演示
+
+```bash
+# 先测试 full_sft 的 tool call 能力
+cd /root/minimind/scripts
+python eval_toolcall.py --weight full_sft
+
+# 跑 Agentic RL 训练（独立脚本，多轮 Tool-Use，默认 CISPO loss）
+python trainer/train_agent.py \
+  --data_path /root/minimind/dataset/agent_rl.jsonl
+```
+
+> 说明：`train_grpo.py` 用于单轮对话 RL（支持 `--loss_type grpo/cispo`）；`train_agent.py` 专用于多轮 Tool-Use Agentic RL，默认 CISPO，也支持 `--loss_type grpo`。
+
+**必须看懂的：**
+- `<tool_call>` 标签的数据格式（在 `dataset/agent_rl.jsonl` 中查看）
+- 多轮 rollout 流程：模型生成 → 执行工具 → 获取结果 → 继续生成
+
+**产出物：**
+```
+experiments/tool_use/
+└── demo_screenshot.png   ← 工具调用成功的完整对话截图
+```
+
+---
+
+## Week 4 后半：知识蒸馏
+
+**目标：** 黑盒蒸馏（用 Jellyfish 的 Mixtral 推理链数据作为 teacher 输出），测推理速度倍数
+
+> 白盒 logits 蒸馏不可用（Jellyfish-7B 与 MiniMind 词表不兼容，6400 vs 32000）
+>
+> 黑盒方案：直接用 `with_generated_reasoning/sm_gen_m8x7b.jsonl`
+> 这是 Jellyfish 用 Mixtral-8x7B 生成的带推理链数据（84K 条），其中
+> `output` = "Yes/No，因为…"（含推理过程），作为 teacher 监督信号
+
+### Step 1 — 构造蒸馏数据
+
+文件路径：`experiments/distillation/prepare_distill_data.py`
+
+```python
+import json
+
+def convert_with_reasoning(input_path, output_path):
+    """用含推理链的 Jellyfish 数据构造蒸馏训练集"""
+    with open(input_path) as fin, open(output_path, 'w') as fout:
+        for line in fin:
+            item = json.loads(line)
+            user_content = item["instruction"] + "\n" + item["input"]
+            out = {
+                "conversations": [
+                    {"role": "user",      "content": user_content},
+                    {"role": "assistant", "content": item["output"]}  # 含 Mixtral 推理链
+                ]
+            }
+            fout.write(json.dumps(out, ensure_ascii=False) + '\n')
+
+if __name__ == "__main__":
+    convert_with_reasoning(
+        "/root/autodl-tmp/jellyfish/train/with_generated_reasoning/sm_gen_m8x7b.jsonl",
+        "/root/autodl-tmp/jellyfish/sm_distill_minimind.jsonl"
+    )
+```
+
+### Step 2 — SFT MiniMind（用蒸馏数据）
+
+```bash
+python trainer/train_full_sft.py \
+  --data_path /root/autodl-tmp/jellyfish/sm_distill_minimind.jsonl
+```
+
+### Step 3 — 推理速度基准测试
+
+文件路径：`experiments/distillation/speed_benchmark.py`
+
+测量内容：
+- MiniMind-64M 推理延迟（tokens/s）
+- 对比参考值：Jellyfish-7B（如有条件本地跑，否则引用论文数字）
+- 各测 50 次请求，记录均值和标准差
+
+```python
+import time, torch
+from model.model_minimind import MiniMindForCausalLM
+
+# 测量 100 token 生成的耗时
+results = []
+for _ in range(50):
+    t0 = time.time()
+    # ... 生成 100 tokens
+    t1 = time.time()
+    results.append(100 / (t1 - t0))  # tokens/s
+
+print(f"MiniMind-64M: {sum(results)/len(results):.1f} tokens/s")
+```
+
+### Step 4 — 效果对比评测
+
+复用 Week 1 的 `eval_sm.py`，对比三个模型：
+1. 基础 full_sft（Week 1 已测）
+2. LoRA 微调（Week 1 已测）
+3. 蒸馏 SFT（本阶段）
+
+### 产出物
+
+```
+experiments/distillation/
+├── prepare_distill_data.py
+├── speed_benchmark.py
+├── speed_results.txt       ← MiniMind-64M 推理速度（tokens/s）
+└── f1_comparison.txt       ← 三种方案 F1 横向对比
+```
+
+**简历数字：**
+- MiniMind-64M 推理速度 XX tokens/s（比 Jellyfish-7B 快约 X 倍）
+- 蒸馏方案 SM F1 = XX，优于/持平直接 LoRA 微调
+
+---
+
+## 实验目录结构（完整）
+
+```
+experiments/
+├── PLAN.md                          ← 本文件
+├── ref/
+│   ├── Team 等 - 2026 - Attention residuals.pdf
+│   └── Zhang 等 - 2024 - Jellyfish A Large Language Model for Data Preprocessing.pdf
+├── lora_schema_matching/
+│   ├── convert_jellyfish.py
+│   ├── eval_sm.py
+│   ├── loss_curve.png
+│   ├── f1_results.txt
+│   └── example_outputs.txt
+├── attnres/
+│   ├── run_comparison.py
+│   ├── plot_results.py
+│   ├── metrics.jsonl
+│   ├── loss_comparison.png
+│   └── layer_norm_comparison.png
+├── dpo/
+│   ├── reward_curve.png
+│   └── qa_comparison.txt
+├── grpo/
+│   └── reward_curve.png
+├── tool_use/
+│   └── demo_screenshot.png
+└── distillation/
+    ├── prepare_distill_data.py
+    ├── speed_benchmark.py
+    ├── speed_results.txt
+    └── f1_comparison.txt
+```
+
+---
+
+## 关键原则
+
+1. **每个数字都真实测量**，不估计、不编造
+2. **先用小数据调试**（`max_samples=2000`），确认代码无误后再全量
+3. **不直接修改原始模型文件**，新建文件做实验版本（如 `model_minimind_attnres.py`）
+4. **每阶段结束立即整理产出物**，不要堆到最后
+
+---
+
+## 面试常见问题（提前准备）
+
+| 问题 | 对应模块 |
+|---|---|
+| 为什么 DPO 不需要 reward model？ | DPO |
+| GRPO 和 PPO 的核心区别？ | GRPO |
+| LoRA 为什么只训练低秩矩阵？参数量是多少？ | LoRA |
+| AttnRes 解决了什么问题？你的实验验证了什么？ | AttnRes |
+| 知识蒸馏为什么能保留大模型能力？黑盒和白盒的区别？ | 蒸馏 |
+| GQA 相比 MHA 的优势？MiniMind 用了几个 KV head？ | 架构 |
+| Jellyfish 的 SM 任务具体在做什么？ | LoRA / 蒸馏 |
