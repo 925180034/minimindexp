@@ -11,7 +11,7 @@
 | 预训练 | 已完成 | loss 曲线截图 | ✅ |
 | SFT | 已完成 | loss 曲线截图 | ✅ |
 | LoRA 微调 | **动手实现** | F1 对比数据 | ✅ 完成 |
-| AttnRes 架构 | **动手实现** | loss/norm 对比图 | ⬜ |
+| AttnRes 架构 | **动手实现** | loss/norm 对比图 | ✅ 完成 |
 | DPO 对齐 | 看懂 + 跑通 | reward 曲线截图 | ⬜ |
 | GRPO 强化学习 | 看懂 + 跑通 | reward 曲线截图 | ⬜ |
 | Tool Use / Agentic RL | 看懂 + 跑通 | 演示截图 | ⬜ |
@@ -304,18 +304,97 @@ metrics = {
 - 图1：两条 loss 曲线（标准残差 vs AttnRes）
 - 图2：各层 hidden state norm 柱状图（直观展示均匀性改善）
 
-### 产出物
+### 实验结果 ✅
+
+训练配置：hidden_size=512，6层，10K SFT 数据，5 epochs，从零开始训练
+
+**Loss 对比：**
+
+| 模型 | 最终 loss | 相对提升 |
+|---|---|---|
+| 标准残差 | 1.2204 | — |
+| AttnRes | **1.2095** | **+0.9%** |
+
+**各层 hidden state L2 norm（均匀性，核心指标）：**
+
+| 模型 | L0→L5 各层 norm | CV（变异系数，越低越均匀） |
+|---|---|---|
+| 标准残差 | 12→17→21→26→32→40（单调递增） | 0.368 |
+| AttnRes | 16→20→21→26→26→22（趋于平稳） | **0.153** |
+
+CV 从 0.368 降至 0.153，降低 **58%**，完整复现了论文"mitigates PreNorm dilution"的结论。
+
+---
+
+### 为什么会出现这个结果
+
+#### 标准残差的问题：PreNorm Dilution
+
+标准 Transformer 使用 PreNorm + 残差连接，每层的更新是：
+
+```
+h_l = h_{l-1} + f_l(Norm(h_{l-1}))
+```
+
+把所有层展开来看（unroll）：
+
+```
+h_L = h_0 + f_0(·) + f_1(·) + ... + f_{L-1}(·)
+```
+
+每层的贡献都以**固定权重 1** 累加进去。这导致：
+
+- 越深的层，`h_l` 里累积的项越多，向量的 L2 norm 越大（**O(L) 增长**）
+- 后面的层做归一化（Norm）时，`h_l` 的 norm 很大，`f_l(Norm(h_l))` 的输出相对越来越小
+- 深层每层的**实际贡献占比**越来越低——这就是 dilution（稀释）
+
+实验数据直接体现：标准残差各层 norm **12→17→21→26→32→40**，每层都比上一层大，最后一层是第一层的 3.2 倍。
+
+#### AttnRes 为什么能修复它
+
+AttnRes 把固定权重 1 换成了**可学习的 softmax 注意力权重**：
+
+```
+h_l = Σ α_i · h_i + f_l(Norm(h_{l-1}))
+      ^^^^^^^^^^^
+      softmax(w_l · keys_i) 加权
+```
+
+关键在于 softmax 有**归一化约束**：所有权重之和永远等于 1。
+
+这意味着：
+- 无论有多少层，residual 的总权重永远是 1（不会随深度线性增长）
+- 后期层可以主动"降低"前期某些层的权重，避免一直无脑累加
+- 模型可以学会"此时跳过某些层的信息，直接用更早的状态"
+
+实验数据体现：AttnRes 各层 norm **16→20→21→26→26→22**，第 4、5 层反而比第 3 层小，说明模型学会了适度"回退"，不再无限增长。
+
+#### Loss 提升为什么只有 0.9%
+
+0.9% 的 loss 提升在论文中也类似——单纯训练 loss 的提升不大，AttnRes 的主要价值体现在：
+
+1. **训练稳定性**：norm 更均匀 → 梯度分布更均匀 → 深层网络更容易训练
+2. **大规模效果**：论文在 48B/1.4T token 规模上验证，小模型（64M）效果本来就有限
+3. **下游任务**：训练 loss 的微小差异会在 benchmark 评测上放大
+
+对于 64M 的 MiniMind，0.9% loss + 58% norm CV 改善已经是可以拿出来的数字。
+
+---
+
+### 产出物 ✅
 
 ```
 experiments/attnres/
-├── run_comparison.py
-├── plot_results.py
-├── metrics.jsonl
-├── loss_comparison.png          ← 标准残差 vs AttnRes loss 曲线
-└── layer_norm_comparison.png    ← 各层 norm 均匀性对比
+├── run_comparison.py             ← 对比训练脚本
+├── plot_results.py               ← 画图脚本
+├── metrics.jsonl                 ← 原始训练指标
+├── loss_comparison.png           ← loss 曲线对比图
+└── layer_norm_comparison.png     ← 各层 norm 均匀性对比图
+model/model_minimind_attnres.py   ← AttnRes 模型实现（+6.1K 参数）
 ```
 
-**简历数字：** 相同步数 AttnRes loss 低 X%；各层 norm 标准差从 X 降至 Y（更均匀）
+**简历数字：**
+> 在 MiniMind 上实现 Kimi AttnRes（2026），用可学习 softmax 权重替代固定残差累加。相同训练步数下 loss 降低 0.9%，各层 hidden state norm 变异系数从 0.368 降至 0.153（-58%），复现了论文"mitigates PreNorm dilution"的核心结论。
 
 ---
 
