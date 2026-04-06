@@ -1,0 +1,53 @@
+典型样本对比（前10条）
+============================================================
+
+[样本 1]
+标签:      Yes
+base 预测: Yes
+lora 预测: Yes
+
+[样本 2]
+标签:      Yes
+base 预测: Yes
+lora 预测: No
+
+[样本 3]
+标签:      Yes
+base 预测: Yes
+lora 预测: Yes
+
+[样本 4]
+标签:      Yes
+base 预测: Yes
+lora 预测: Yes
+
+[样本 5]
+标签:      Yes
+base 预测: Yes
+lora 预测: Yes
+
+[样本 6]
+标签:      Yes
+base 预测: Yes
+lora 预测: Yes
+
+[样本 7]
+标签:      Yes
+base 预测: Yes
+lora 预测: Yes
+
+[样本 8]
+标签:      Yes
+base 预测: Yes
+lora 预测: Yes
+
+[样本 9]
+标签:      No
+base 预测: Yes
+lora 预测: No
+
+[样本 10]
+标签:      No
+base 预测: Yes
+lora 预测: No
+

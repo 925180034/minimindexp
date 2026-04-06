@@ -97,6 +97,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-LoRA", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--lora_rank", default=16, type=int, help="LoRA秩，越大参数越多表达能力越强（建议32或64）")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -125,7 +126,7 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    apply_lora(model)
+    apply_lora(model, rank=args.lora_rank)
     
     # 统计参数
     total_params = sum(p.numel() for p in model.parameters())
