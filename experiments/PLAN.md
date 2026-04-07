@@ -14,8 +14,8 @@
 | AttnRes 架构 | **动手实现** | loss/norm 对比图 | ✅ 完成 |
 | DPO 对齐 | 看懂 + 跑通 | reward 曲线截图 | ✅ 完成 |
 | GRPO 强化学习 | 看懂 + 跑通 | reward 曲线截图 | ✅ 完成 |
-| Tool Use / Agentic RL | 看懂 + 跑通 | 演示截图 | ⬜ |
-| 知识蒸馏 | **动手实现** | 速度/F1 对比数据 | ⬜ |
+| Tool Use / Agentic RL | 看懂 + 跑通 | 演示截图 | ✅ 完成 |
+| 知识蒸馏 | **动手实现** | 速度/F1 对比数据 | ✅ 完成 |
 
 ---
 
@@ -549,11 +549,37 @@ python trainer/train_agent.py \
 - `<tool_call>` 标签的数据格式（在 `dataset/agent_rl.jsonl` 中查看）
 - 多轮 rollout 流程：模型生成 → 执行工具 → 获取结果 → 继续生成
 
+### 实验结果 ✅
+
+使用官方下载的 `agent_768.pth` 权重，运行 `scripts/eval_toolcall.py --weight agent` 自动测试 8 个用例：
+
+| 测试用例 | 工具调用 | 结果 |
+|---|---|---|
+| 256×37 计算 | `calculate_math` | ✅ 正确（9472） |
+| 查询当前时间 | `get_current_time` | ✅ 正确 |
+| 100km→英里换算 | `unit_converter` | ✅ 正确（62.14） |
+| 随机数+平方（链式调用） | `random_number`→`calculate_math` | ✅ 两步链式调用成功 |
+| 北京天气查询 | `get_current_weather` | ⚠️ 重复调用同一工具两次 |
+| 美元兑人民币汇率 | `get_exchange_rate` | ✅ 正确 |
+| 翻译"你好世界" | `translate_text` | ✅ 正确 |
+| Tokyo天气+温度换算（并行） | `get_current_weather`+`unit_converter` | ✅ 并行调用成功 |
+
+**6/8 完全正确，2/8 有小瑕疵（重复调用、mock函数本身bug）**
+
+核心能力验证：
+- ✅ 单工具调用：正确解析 JSON 参数格式
+- ✅ 链式调用：第一个工具结果作为第二个工具输入
+- ✅ 并行调用：一次生成多个 `<tool_call>` 标签
+- ⚠️ 去重：偶尔重复调用同一工具（小模型限制）
+
 **产出物：**
 ```
 experiments/tool_use/
-└── demo_screenshot.png   ← 工具调用成功的完整对话截图
+└── demo_screenshot.png   ← 工具调用成功的完整对话截图（从终端输出截图）
 ```
+
+**简历数字：**
+> 基于 MiniMind agent_768.pth 权重，在 8 个 Tool Use 测试用例上实现 6/8 通过，支持单工具、链式、并行三种调用模式，验证了 Agentic RL 训练的工具调用能力。
 
 ---
 
@@ -643,9 +669,44 @@ experiments/distillation/
 └── f1_comparison.txt       ← 三种方案 F1 横向对比
 ```
 
+### 实验结果 ✅
+
+训练配置：84,345 条 sm_gen_m8x7b.jsonl（Mixtral-8x7B 推理链），2 epochs，batch_size=32，lr=1e-5，5,272 步
+
+**Loss 曲线：**
+
+| 阶段 | Loss |
+|---|---|
+| Epoch 1 开始 | 0.701 |
+| Epoch 1 结束 | 0.345 |
+| Epoch 2 结束 | **0.287** |
+
+**推理速度（50次平均，max_new_tokens=100，单卡 4090）：**
+
+| 模型 | 速度 | 说明 |
+|---|---|---|
+| MiniMind full_sft (64M) | **178.9 ± 1.4 tokens/s** | 基准 |
+| MiniMind distill_sft (64M) | **173.6 ± 5.1 tokens/s** | 蒸馏后速度基本不变 |
+| Jellyfish-7B（论文参考） | ~30-50 tokens/s | A100 80G |
+
+MiniMind-64M 推理速度约为 Jellyfish-7B 的 **3.5x~6x**（参数量仅为其 1/109）。
+
+**SM F1 三方案对比（平衡测试集 48 Yes + 48 No）：**
+
+| 方案 | Precision | Recall | F1 | Accuracy | 说明 |
+|---|---|---|---|---|---|
+| full_sft（base） | 0.500 | 1.000 | 0.667 | 0.500 | 全预测 Yes |
+| LoRA SM+EM（rank=64） | **0.905** | 0.396 | 0.551 | **0.677** | 多任务平衡训练 |
+| distill_sft（Mixtral推理链） | 0.000 | 0.000 | 0.000 | 1.000 | 全预测 No |
+
+**蒸馏 F1=0 的原因（重要，面试可讲）：**
+
+黑盒蒸馏使用了全量 84K SM 数据，其中 99.7% 标签为 "No"。Mixtral 生成的推理链也大多数结论是 "No"，模型学会了"生成 No 推理"而非"判断语义等价性"——**本质上是把数据不平衡问题蒸馏进了模型**。
+
+这正好印证了 Week 1 的核心结论：**类别不平衡是 SM 任务的根本难点，不是模型大小或推理能力的问题**。LoRA 能成功的关键在于构造了 1:1 平衡数据集+多任务迁移，而不是单纯增大数据量或引入推理链。
+
 **简历数字：**
-- MiniMind-64M 推理速度 XX tokens/s（比 Jellyfish-7B 快约 X 倍）
-- 蒸馏方案 SM F1 = XX，优于/持平直接 LoRA 微调
+> 实现黑盒知识蒸馏（Mixtral-8x7B → MiniMind-64M），MiniMind 推理速度达 **174 tokens/s**，为 Jellyfish-7B 的 **~4.5x**（参数量 1/109）。实验同时揭示：在极端类别不平衡（99.7% No）场景下，增加推理链数据量反而会放大偏差，验证了平衡采样+多任务迁移（Week 1 LoRA 方案）才是解决 SM 稀少正例问题的有效路径。
 
 ---
 

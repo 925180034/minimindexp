@@ -1,0 +1,9 @@
+推理速度基准测试（50次平均，max_new_tokens=100）
+设备: cuda
+
+full_sft: 178.9 ± 1.4 tokens/s
+distill_sft: 173.6 ± 5.1 tokens/s
+
+distill_sft / full_sft 速度比: 0.97x
+
+参考：Jellyfish-7B 约 30-50 tokens/s（A100 80G）
