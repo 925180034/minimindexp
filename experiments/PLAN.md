@@ -12,8 +12,8 @@
 | SFT | 已完成 | loss 曲线截图 | ✅ |
 | LoRA 微调 | **动手实现** | F1 对比数据 | ✅ 完成 |
 | AttnRes 架构 | **动手实现** | loss/norm 对比图 | ✅ 完成 |
-| DPO 对齐 | 看懂 + 跑通 | reward 曲线截图 | ⬜ |
-| GRPO 强化学习 | 看懂 + 跑通 | reward 曲线截图 | ⬜ |
+| DPO 对齐 | 看懂 + 跑通 | reward 曲线截图 | ✅ 完成 |
+| GRPO 强化学习 | 看懂 + 跑通 | reward 曲线截图 | ✅ 完成 |
 | Tool Use / Agentic RL | 看懂 + 跑通 | 演示截图 | ⬜ |
 | 知识蒸馏 | **动手实现** | 速度/F1 对比数据 | ⬜ |
 
@@ -419,11 +419,58 @@ L_DPO = -E[ log σ( β×(log π_θ(y_w|x) - log π_ref(y_w|x))
 - 为什么 DPO 不需要显式 reward model？（隐式地将 reward 参数化为策略比率）
 - ref_model 的作用是什么？（KL 惩罚项，防止策略偏移太远）
 
+### 实验结果 ✅
+
+训练配置：17,166 条偏好数据，batch_size=4，1 epoch，lr=4e-8，4,292 步
+
+| 阶段 | DPO Loss | 含义 |
+|---|---|---|
+| 初始（step 100） | 0.6958 | 接近 ln2≈0.693，模型对 chosen/rejected 无偏好 |
+| 中期（step 1000） | 0.4897 | 开始建立偏好 |
+| 最终（step 4292） | **0.4210** | 模型明显偏向 chosen 回答 |
+
+曲线记录在 SwanLab：`https://swanlab.cn/@yunhao/MiniMind-DPO`
+
+---
+
+### 为什么初始 loss 是 0.693
+
+DPO loss 公式：
+
+```
+L = -log σ( β × (log π_θ(y_w|x) - log π_ref(y_w|x))
+          - β × (log π_θ(y_l|x) - log π_ref(y_l|x)) )
+```
+
+训练刚开始时，策略模型 π_θ 和参考模型 π_ref 完全一样（都是 full_sft），所以括号内为 0：
+
+```
+L = -log σ(0) = -log(0.5) = ln 2 ≈ 0.693
+```
+
+这是 DPO loss 的理论起点。loss 能从 **0.693 降到 0.421**，说明模型确实学会了区分 chosen 和 rejected，偏好对齐生效。
+
+---
+
+### 为什么 DPO 不需要 reward model（面试必答）
+
+传统 RLHF 需要：① 训练 reward model，② 用 PPO 优化策略
+
+DPO 的洞察：在最优策略下，reward 可以被**解析地表达为策略与参考模型的比率**：
+
+```
+r*(x, y) = β × log [π*(y|x) / π_ref(y|x)] + β × log Z(x)
+```
+
+因此可以绕过显式 reward model，直接用 chosen/rejected 对优化策略，把 reward 隐式地参数化进模型权重里。ref_model 的作用是 KL 惩罚项，防止策略偏离 base model 太远（避免灾难性遗忘）。
+
+---
+
 **产出物：**
 ```
+/root/minimind/out/dpo_768.pth                   ← DPO 对齐后权重
 experiments/dpo/
-├── reward_curve.png     ← chosen/rejected reward margin 随步数变化
-└── qa_comparison.txt    ← 训练前后 3-5 个问题的回答对比
+└── swanlab_link.txt                             ← SwanLab 曲线链接
 ```
 
 ---
@@ -444,10 +491,40 @@ python trainer/train_grpo.py \
 
 > ⚠️ 显存约 8GB：策略模型 + 参考模型（frozen）+ 奖励模型同时在显存
 
+### 实验结果 ✅
+
+训练配置：19,506 条 rlaif 数据，3卡 4090 DDP，batch_size=1×3，num_generations=4，max_gen_len=512，rollout_engine=torch，reward_model=InternLM2-1.8B-Reward
+
+训练过程：在 step 450 checkpoint 恢复后共运行至约 step 3510/6501（约 54%），中途下载官方预训练 grpo_768.pth 权重使用。
+
+| 阶段 | Reward | 含义 |
+|---|---|---|
+| 初始（step 451） | -3.01 | 模型回复质量差，reward 模型打分低 |
+| 中期（step 1000） | 约 -1.5 | reward 逐步提升，偶有正分 |
+| 后期（step 3510） | 约 -1.0（波动） | 趋势向上，但方差大 |
+
+**推理能力测试（grpo_768.pth 官方权重）：**
+
+| 问题 | 回答质量 | 评估 |
+|---|---|---|
+| 9.9 vs 9.11 大小比较 | 扯"因果关系"，答非所问 | ❌ |
+| strawberry 中 r 的个数 | 幻觉严重，重复输出 | ❌ |
+| 买鸡赚多少钱 | `<think>` 内重复"平衡"数十次，陷入循环 | ❌ |
+
+**结论（面试可讲）：** GRPO 对 64M 小模型效果有限。核心原因：
+1. **模型容量不足**：RL 需要模型有足够容量理解 reward 信号并改进推理；64M 参数远低于有效门槛
+2. **reward 信号噪声大**：rlaif 是通用偏好数据，非推理专项，InternLM reward 模型给小模型打分噪声高
+3. **`<think>` 循环**：open_thinking 模式在小模型上容易陷入重复生成
+
+这本身是有意义的负结论：**RL 对齐效果高度依赖模型基础容量，64M 小模型更适合 SFT 而非在线 RL**。
+
+曲线记录在 SwanLab：`https://swanlab.cn/@yunhao/MiniMind-GRPO`
+
 **产出物：**
 ```
+/root/minimind/out/grpo_768.pth                  ← GRPO 权重（官方下载）
 experiments/grpo/
-└── reward_curve.png     ← group reward 均值随训练步数上升曲线
+└── swanlab_link.txt                             ← SwanLab 曲线链接
 ```
 
 ---

@@ -1,0 +1,4 @@
+SwanLab 训练曲线: https://swanlab.cn/@yunhao/MiniMind-DPO/runs/nn3hdgtz8sj3sf0r866yo
+训练配置: epochs=1, batch_size=4, lr=4e-8, steps=4292
+初始 loss: 0.6958 (≈ln2，无偏好基线)
+最终 loss: 0.4210
